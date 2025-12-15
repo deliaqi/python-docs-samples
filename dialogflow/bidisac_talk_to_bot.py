@@ -46,10 +46,6 @@ from six.moves import queue
 import conversation_management
 import participant_management
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
 CONVERSATION_PROFILE_ID = os.getenv("CONVERSATION_PROFILE")
 LOCATION_ID = os.getenv("LOCATION_ID", "global")
