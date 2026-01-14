@@ -46,6 +46,10 @@ from six.moves import queue
 import conversation_management
 import participant_management
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
 CONVERSATION_PROFILE_ID = os.getenv("CONVERSATION_PROFILE")
 LOCATION_ID = os.getenv("LOCATION_ID", "global")
@@ -157,13 +161,6 @@ class ResumableMicrophoneStream:
             # overflow while the calling thread makes network requests, etc.
             stream_callback=self._fill_buffer,
         )
-        # For audios playback to the speaker
-        self._reply_audio_stream = self._audio_interface.open(
-            format=pyaudio.paInt16,
-            channels=self._num_channels,
-            rate=self._rate,
-            output=True,
-        )
 
     def __enter__(self):
         self.closed = False
@@ -184,11 +181,6 @@ class ResumableMicrophoneStream:
 
         self._buff.put(in_data)
         return None, pyaudio.paContinue
-    
-    def play_audio(self, audio_data):
-        """Writes audio data directly to the speaker"""
-        if not self.closed and audio_data:
-            self._reply_audio_stream.write(audio_data)
 
     def generator(self):
         """Stream Audio from microphone to API and to local buffer"""
@@ -291,50 +283,69 @@ def main():
     sys.stdout.write("End (ms)       Transcript Results/Status\n")
     sys.stdout.write("=====================================================\n")
 
-    with mic_manager as stream:
-        while not stream.closed:
-            terminate = False
-            while not terminate:
-                try:
-                    stream_start_time = datetime.now()
-                    print(f"{stream_start_time}: New Streaming Analyze Request: {stream.restart_counter}")
-                    stream.restart_counter += 1
-                    # Send request to streaming and get response.
-                    responses = participant_management.bidi_analyze_content_audio_stream(
-                        conversation_id=conversation_id,
-                        participant_id=participant_id,
-                        sample_rate_herz=SAMPLE_RATE,
-                        stream=stream,
-                        timeout=RESTART_TIMEOUT,
-                    )
+    try:
+        with mic_manager as stream:
+            while not stream.closed:
+                terminate = False
+                while not terminate:
+                    try:
+                        stream_start_time = datetime.now()
+                        print(f"{stream_start_time}: New Streaming Analyze Request: {stream.restart_counter}")
+                        stream.restart_counter += 1
+                        # Send request to streaming and get response.
+                        responses = participant_management.bidi_analyze_content_audio_stream(
+                            conversation_id=conversation_id,
+                            participant_id=participant_id,
+                            sample_rate_herz=SAMPLE_RATE,
+                            stream=stream,
+                            timeout=RESTART_TIMEOUT,
+                            location_id=LOCATION_ID,
+                        )
+                        for response in responses:
+                            # Handle Barge-In
+                            if getattr(response, "recognition_result", None):
+                                rr = response.recognition_result
+                                # If there's a transcript or speech activity begin, stop playback
+                                if (getattr(rr, "transcript", None)
+                                    or getattr(rr, "message_type", None)
+                                    == dialogflow_v2beta1.StreamingRecognitionResult.MessageType.SPEECH_ACTIVITY_BEGIN):
+                                    player.stop_playback()
 
-                    # Now, print the final transcription responses to user.
-                    for response in responses:
-                        if response.analyze_content_response:
-                            print(f"[{datetime.now()}] Received analyze_content_response: {response}")
-                        if response.recognition_result.is_final:
-                            print(f"[{datetime.now()}] Received final transcript result: {response}")
-                            # offset return from recognition_result is relative
-                            # to the beginning of audio stream.
-                            offset = response.recognition_result.speech_end_offset
-                            stream.is_final_offset = int(
-                                offset.seconds * 1000 + offset.microseconds / 1000
-                            )
-                            transcript = response.recognition_result.transcript
-                            # Half-close the stream with gRPC (in Python just stop yielding requests) when approaching API time limit.
-                            if (datetime.now() - stream_start_time).seconds > HALF_CLOSE_TIMEOUT:
-                                print(f"[{datetime.now()}] Prepare stream restart on first final result after {HALF_CLOSE_TIMEOUT} seconds")
-                                stream.is_final = True 
-                            # Exit recognition if any of the transcribed phrase could be
-                            # one of our keywords.
-                            if re.search(r"\b(exit|quit|stop)\b", transcript, re.I):
-                                sys.stdout.write(YELLOW)
-                                sys.stdout.write("Exiting...\n")
-                                terminate = True
-                                stream.closed = True
-                                break
-                except (DeadlineExceeded) as e:
-                    print(f"[{datetime.now()}] Deadline Exceeded, restarting.")
+                            if response.analyze_content_response:     
+                                if response.analyze_content_response.reply_text:
+                                    print(f"[{datetime.now()}] Received analyze content reply text: {response.analyze_content_response.reply_text}")
+                                # For playbook agent, the audio reply is in the automated agent reply segments
+                                for response_message in response.analyze_content_response.automated_agent_reply.response_messages:
+                                    for segment in response_message.mixed_audio.segments:
+                                        if segment.audio:
+                                            # enqueue to async player (or fallback)
+                                            player.add_audio(segment.audio)
+                                # For PS Bot, the audio is in reply audio
+                                if getattr(response.analyze_content_response, 'reply_audio', None) and response.analyze_content_response.reply_audio.audio:
+                                    player.add_audio(ResumableMicrophoneStream._remove_wav_header(response.analyze_content_response.reply_audio.audio))
+                            if getattr(response, "recognition_result", None) and response.recognition_result.is_final:
+                                print(f"[{datetime.now()}] Received final transcript result: {response}")
+                                # offset return from recognition_result is relative
+                                # to the beginning of audio stream.
+                                offset = response.recognition_result.speech_end_offset
+                                stream.is_final_offset = int(
+                                    offset.seconds * 1000 + offset.microseconds / 1000
+                                )
+                                transcript = response.recognition_result.transcript
+                                # Half-close the stream with gRPC (in Python just stop yielding requests) when approaching API time limit.
+                                if (datetime.now() - stream_start_time).seconds > HALF_CLOSE_TIMEOUT:
+                                    print(f"[{datetime.now()}] Prepare stream restart on first final result after {HALF_CLOSE_TIMEOUT} seconds")
+                                    stream.is_final = True 
+                                # Exit recognition if any of the transcribed phrase could be
+                                # one of our keywords.
+                                if re.search(r"\b(exit|quit|stop)\b", transcript, re.I):
+                                    sys.stdout.write(YELLOW)
+                                    sys.stdout.write("Exiting...\n")
+                                    terminate = True
+                                    stream.closed = True
+                                    break
+                    except (DeadlineExceeded) as e:
+                        print(f"[{datetime.now()}] Deadline Exceeded, restarting.")
 
                 if terminate:
                     conversation_management.complete_conversation(
