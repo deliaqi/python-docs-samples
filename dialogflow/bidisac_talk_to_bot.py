@@ -320,6 +320,12 @@ def main():
                                         if segment.audio:
                                             # enqueue to async player (or fallback)
                                             player.add_audio(segment.audio)
+                                    if "end_interaction" in response_message:
+                                        sys.stdout.write(YELLOW)
+                                        sys.stdout.write("End of interaction detected...\n")
+                                        terminate = True
+                                        stream.closed = True
+                                        
                                 # For PS Bot, the audio is in reply audio
                                 if getattr(response.analyze_content_response, 'reply_audio', None) and response.analyze_content_response.reply_audio.audio:
                                     player.add_audio(ResumableMicrophoneStream._remove_wav_header(response.analyze_content_response.reply_audio.audio))
